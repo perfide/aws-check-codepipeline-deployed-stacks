@@ -1,0 +1,125 @@
+#!/usr/bin/env python
+# -*- coding: UTF-8 -*-
+
+# Copyright:
+#   2019 P. H. <github.com/perfide>
+# License:
+#   BSD-2-Clause (BSD 2-Clause "Simplified" License)
+#   https://spdx.org/licenses/BSD-2-Clause.html
+
+"""Find CloudFormation-stacks which are not deployed by CodePipline"""
+
+# included
+import argparse
+import configparser
+import os
+import re
+import sys
+
+# external
+import botocore
+import boto3
+
+
+def for_matching_profiles(search_pattern, function):
+    """call function(profile_name) for every profile"""
+    sre_pattern = re.compile(search_pattern)
+    config_path = os.path.expanduser('~/.aws/config')
+    profiles = configparser.ConfigParser()
+    profiles.read(config_path)
+
+    for profile_name in profiles:
+        if profile_name == 'DEFAULT':
+            print('ignoring {} profile'.format(profile_name), file=sys.stderr)
+
+        elif not profile_name.startswith('profile '):
+            print('ignoring {}'.format(profile_name), file=sys.stderr)
+
+        else:
+            profile_name = profile_name.split(' ', 1)[1]
+            if sre_pattern.search(profile_name):
+                function(profile_name)
+    return
+# end def for_all_aws_profiles
+
+
+def get_stack_names_from_cfn(session):
+    cfn_client = session.client('cloudformation')
+    paginator = cfn_client.get_paginator('list_stacks')
+    page_iterator = paginator.paginate()
+    try:
+        for page in page_iterator:
+            stack = page['StackSummaries']
+            for output in stack:
+                yield output['StackName']
+    except botocore.exceptions.ClientError as e:
+        error_code = e.response['Error']['Code']
+        if error_code not in ('AccessDenied', 'ExpiredToken'):
+            raise
+        print('failed to assume for cfn: {}'.format(error_code),
+              file=sys.stderr)
+    return
+# end def get_stack_names_from_cfn
+
+
+def get_stack_names_from_cp(session):
+    cp_client = session.client('codepipeline')
+    list_pipelines_paginator = cp_client.get_paginator('list_pipelines')
+    page_iterator = list_pipelines_paginator.paginate()
+    try:
+        for page in page_iterator:
+            for pipeline in page['pipelines']:
+                pipeline_info = cp_client.get_pipeline(name=pipeline['name'])
+                for stage in pipeline_info['pipeline']['stages']:
+                    for action in stage['actions']:
+                        category = action['actionTypeId']['category']
+                        if category == 'Deploy':
+                            stack_name = action['configuration']['StackName']
+                            yield stack_name
+    except botocore.exceptions.ClientError as e:
+        error_code = e.response['Error']['Code']
+        if error_code not in ('AccessDenied', 'ExpiredToken'):
+            raise
+        print('failed to assume for cp: {}'.format(error_code),
+              file=sys.stderr)
+    return
+# end def get_stack_names_from_cp
+
+
+def compare_stack_names(profile_name):
+    print('profile: {}'.format(profile_name), file=sys.stderr)
+
+    session = boto3.Session(profile_name=profile_name)
+    stack_names_cfn = set(get_stack_names_from_cfn(session))
+    stack_names_cp = set(get_stack_names_from_cp(session))
+    non_cp_stacks = stack_names_cfn - stack_names_cp
+    for non_cp_stack in non_cp_stacks:
+        print('{};{}'.format(profile_name, non_cp_stack))
+    print('', file=sys.stderr)
+    return
+# end def compare_stack_names
+
+
+def main():
+    argparser = argparse.ArgumentParser(
+        prog='check-cp-deployed-stacks',
+        description=('Find CloudFormation-stacks which are not deployed by '
+                     'CodePipline'))
+    argparser.add_argument('--filter',
+                           action='store',
+                           type=str,
+                           default='.+',
+                           help='regex to filter profile names')
+    args = argparser.parse_args()
+    for_matching_profiles(args.filter, compare_stack_names)
+    return
+# end def main
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except KeyboardInterrupt:
+        print('\ninterrupted by keyboard')
+
+# [EOF]
